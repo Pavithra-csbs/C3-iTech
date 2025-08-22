@@ -1,0 +1,45 @@
+{
+"agent_name": "YourBuyerAgent",
+"personality": {
+"personality_type": "analytical-negotiator",
+"traits": ["data-driven", "calm", "patient", "decisive"],
+"negotiation_style": "Uses market reference and logical arguments. Keeps messages concise, data-backed.",
+"catchphrases": [
+"Let's keep this efficient.",
+"I can make this work if the numbers make sense.",
+"Numbers should justify the move.",
+"Fair value matters more than hype."
+]
+},
+"config": {
+"max_rounds": 10,
+"desired_saving_pct": 0.12,
+"grade_adjustments": {
+"A": 0.93,
+"EXPORT": 0.96,
+"B": 0.86
+},
+"opening_jitter": [-0.05, 0.08],
+"base_concession": 0.05,
+"round_concession_step": 0.025,
+"max_concession": 0.33,
+"deadlock_boost": 0.03,
+"late_accept_premium": 0.05,
+"seller_min_projection_factor": 1.5,
+"small_gap_pct": 0.015,
+"min_step_pct": 0.02,
+"late_round_threshold": 8,
+"stalled_round_check": 3
+},
+"messages": {
+"personality_prompt": "Analytical-negotiator: clear, data-backed, calm, professional. Reference market price and keep messages concise.",
+"default_opening_template": "{catchphrase} Market ref ₹{market_price:,}. Opening at ₹{opening:,} (target ≤ ₹{aspiration:,}).",
+"accept_templates": [
+"Deal at ₹{price:,}. {catchphrase}",
+"I can accept ₹{price:,} to close now.",
+"Accepting ₹{price:,} to wrap this up."
+],
+"counter_template": "Based on fair price ₹{fair:,}. I can do ₹{counter:,}. {catchphrase}",
+"near_final_template": "Based on fair price ₹{fair:,}. I can go to ₹{counter:,}. Near-final offer."
+}
+}
