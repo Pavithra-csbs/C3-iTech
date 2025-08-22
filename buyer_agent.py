@@ -1,22 +1,21 @@
-"""
-Final Buyer Agent with Advanced Strategies and Concordia Compatibility
-Filename: buyer_agent.py
-"""
-
-from __future__ import annotations
+# buyer_concordia_agent.py
+import os
+import json
 import random
-from typing import Dict, List, Tuple, Any
-from dataclasses import dataclass
+import time
+import requests
+from dataclasses import dataclass, asdict
+from typing import Any, Dict, List, Optional, Tuple
 from enum import Enum
-from abc import ABC, abstractmethod
 
-# ---------------------------
-# Concordia imports (safe fallback)
-# ---------------------------
+# -------------------------
+# Concordia base fallback
+# -------------------------
 try:
     from concordia.components import entity_component
     ContextComponentBase = entity_component.ContextComponent  # type: ignore
-except Exception:  # fallback for local runs
+except Exception:
+    # Minimal fallback so file can run without installing Concordia.
     class ContextComponentBase:
         def get_state(self) -> Dict[str, Any]:
             return {}
@@ -25,30 +24,27 @@ except Exception:  # fallback for local runs
         def make_pre_act_value(self) -> str:
             return ""
 
-# ============================================
-# PART 1: DATA STRUCTURES
-# ============================================
-
+# -------------------------
+# Domain dataclasses
+# -------------------------
 @dataclass
 class Product:
-    """Product being negotiated"""
     name: str
     category: str
     quantity: int
-    quality_grade: str  # 'A', 'B', or 'Export'
+    quality_grade: str
     origin: str
-    base_market_price: int  # Reference price for this product
+    base_market_price: int
     attributes: Dict[str, Any]
 
 @dataclass
 class NegotiationContext:
-    """Current negotiation state"""
     product: Product
-    your_budget: int
+    budget: int
     current_round: int
     seller_offers: List[int]
-    your_offers: List[int]
-    messages: List[Dict[str, str]]
+    buyer_offers: List[int]
+    history: List[Dict[str, Any]]
 
 class DealStatus(Enum):
     ONGOING = "ongoing"
@@ -56,206 +52,377 @@ class DealStatus(Enum):
     REJECTED = "rejected"
     TIMEOUT = "timeout"
 
-# ============================================
-# PART 2: BASE AGENT CLASS
-# ============================================
+# ====================================================
+# Memory Component
+# ====================================================
+class MemoryComponent(ContextComponentBase):
+    """Store and retrieve negotiation history (rounds, messages, offers)."""
 
-class BaseBuyerAgent(ABC):
-    """Base class for all buyer agents"""
-    def __init__(self, name: str):
-        self.name = name
-        self.personality = self.define_personality()
+    def __init__(self):
+        self._history: List[Dict[str, Any]] = []
 
-    @abstractmethod
-    def define_personality(self) -> Dict[str, Any]:
-        pass
+    def add_entry(self, entry: Dict[str, Any]) -> None:
+        self._history.append(entry)
 
-    @abstractmethod
-    def generate_opening_offer(self, context: NegotiationContext) -> Tuple[int, str]:
-        pass
+    def get_history(self) -> List[Dict[str, Any]]:
+        return list(self._history)
 
-    @abstractmethod
-    def respond_to_seller_offer(
-        self, context: NegotiationContext, seller_price: int, seller_message: str
-    ) -> Tuple[DealStatus, int, str]:
-        pass
+    def clear(self) -> None:
+        self._history = []
 
-    @abstractmethod
-    def get_personality_prompt(self) -> str:
-        pass
-
-# ============================================
-# YOUR IMPLEMENTATION STARTS HERE
-# ============================================
-
-class YourBuyerAgent(BaseBuyerAgent):
-    """
-    Advanced analytical buyer agent:
-    ✔ Predictive concessions
-    ✔ Deadlock detection
-    ✔ Market-aware strategy
-    ✔ Personality consistency
-    ✔ Concordia-ready state & pre-act context
-    """
-
-    CONFIG = {
-        "max_rounds": 10,
-        "desired_saving_pct": 0.12,
-        "grade_adjustments": {"A": 0.93, "EXPORT": 0.96, "B": 0.86},
-        "opening_jitter": (-0.05, 0.08),
-        "base_concession": 0.05,
-        "round_concession_step": 0.025,
-        "max_concession": 0.33,
-        "deadlock_boost": 0.03,
-        "late_accept_premium": 0.05,
-        "seller_min_projection_factor": 1.5,
-        "small_gap_pct": 0.015,
-        "min_step_pct": 0.02,
-        "late_round_threshold": 8,
-        "stalled_round_check": 3
-    }
-
-    def define_personality(self) -> Dict[str, Any]:
-        return {
-            "personality_type": "analytical-negotiator",
-            "traits": ["data-driven", "calm", "patient", "decisive"],
-            "negotiation_style": (
-                "Uses market reference and logical arguments. Keeps messages concise, data-backed."
-            ),
-            "catchphrases": [
-                "Let's keep this efficient.",
-                "I can make this work if the numbers make sense.",
-                "Numbers should justify the move.",
-                "Fair value matters more than hype."
-            ]
-        }
-
-    # ---------- State Management ----------
     def get_state(self) -> Dict[str, Any]:
-        return {"name": self.name, "personality": self.personality}
+        return {"history": self._history}
 
     def set_state(self, state: Dict[str, Any]) -> None:
-        if state:
-            self.name = state.get("name", self.name)
-            self.personality = state.get("personality", self.personality)
+        if not state:
+            return
+        self._history = state.get("history", [])
 
-    def make_pre_act_value(self, context: NegotiationContext) -> str:
-        last_s = context.seller_offers[-1] if context.seller_offers else None
-        last_b = context.your_offers[-1] if context.your_offers else None
+    def make_pre_act_value(self) -> str:
+        # Provide a short summary for the LLM: last 3 entries
+        summary = self._history[-3:]
+        if not summary:
+            return "No negotiation history yet."
+        s = "Recent negotiation history:\n"
+        for e in summary:
+            s += f"Round {e.get('round')} | Seller: ₹{e.get('seller_price')} | Buyer: {e.get('buyer_offer')} | Note: {e.get('note','')}\n"
+        return s
+
+# ====================================================
+# Personality Component (Data Analyst)
+# ====================================================
+class BuyerPersonalityComponent(ContextComponentBase):
+    """Your agent's personality definition (Data Analyst)."""
+
+    def __init__(self):
+        self.personality = {
+            "archetype": "Data Analyst",
+            "traits": ["data-driven", "calm", "concise", "evidence-first"],
+            "negotiation_style": "Quotes market research, calculates fair prices, uses logical arguments, maintains professional tone."
+        }
+        self._notes: List[str] = []  # optional internal notes (e.g., justifications)
+
+    def make_pre_act_value(self) -> str:
+        # Return personality context that LLM can use to keep consistent role & tone
+        traits = ", ".join(self.personality["traits"])
         return (
-            f"[Persona: {self.personality['personality_type']} | Traits: {', '.join(self.personality['traits'])}] "
-            f"[Round {context.current_round}/{self.CONFIG['max_rounds']}] "
-            f"[Last buyer: {last_b}; Last seller: {last_s}] "
-            f"[Market ref: ₹{context.product.base_market_price:,}; Budget: ₹{context.your_budget:,}]"
+            f"Persona: {self.personality['archetype']} ({traits}). "
+            f"Style: {self.personality['negotiation_style']}. "
+            "Keep responses concise, reference market numbers and fairness, avoid threats or emotional language."
         )
 
-    # ---------- Price Modeling ----------
-    def calculate_fair_and_target(self, product: Product) -> Dict[str, int]:
+    def add_note(self, note: str) -> None:
+        self._notes.append(note)
+
+    def get_state(self) -> Dict[str, Any]:
+        return {"personality": self.personality, "notes": list(self._notes)}
+
+    def set_state(self, state: Dict[str, Any]) -> None:
+        if not state:
+            return
+        self.personality = state.get("personality", self.personality)
+        self._notes = state.get("notes", [])
+
+# ====================================================
+# Observation Component
+# ====================================================
+class ObservationComponent(ContextComponentBase):
+    """
+    Process seller messages and offers.
+    Extract numeric price if present and classify message intent.
+    """
+
+    def __init__(self):
+        pass
+
+    def parse_seller_message(self, message: str) -> Dict[str, Any]:
+        """
+        Very simple parser: looks for '₹' or digits and returns the first price found.
+        Returns a dict: {"price": int or None, "intent": str, "raw": message}
+        """
+        price = None
+        tokens = message.replace(",", " ").split()
+        for t in tokens:
+            if t.startswith("₹"):
+                try:
+                    price = int(t.lstrip("₹").replace(",", ""))
+                    break
+                except:
+                    continue
+            else:
+                # also accept plain digits
+                cleaned = "".join(ch for ch in t if ch.isdigit())
+                if cleaned and len(cleaned) >= 3:  # heuristic
+                    try:
+                        p = int(cleaned)
+                        # sanity filter: price close to realistic range
+                        price = p
+                        break
+                    except:
+                        continue
+        # intent heuristics
+        lower = message.lower()
+        if any(k in lower for k in ["final", "last", "take it", "take this", "firm"]):
+            intent = "firm"
+        elif any(k in lower for k in ["discount", "offer", "reduce", "negotiable", "quick deal"]):
+            intent = "offer"
+        else:
+            intent = "inform"
+        return {"price": price, "intent": intent, "raw": message}
+
+    def make_pre_act_value(self) -> str:
+        return "Observation component active: parses seller messages and extracts offered price and intent."
+
+# ====================================================
+# Decision Component
+# ====================================================
+class DecisionComponent(ContextComponentBase):
+    """
+    Implements negotiation strategy (Data Analyst).
+    Numeric decisions come from this component; LLM is used only to phrase responses.
+    """
+
+    def __init__(self, personality: BuyerPersonalityComponent, memory: MemoryComponent,
+                 backend: str = "ollama", ollama_model: str = "llama3",
+                 ollama_url: str = "http://localhost:11434/api/generate"):
+        self.personality = personality
+        self.memory = memory
+        self.backend = backend
+        self.ollama_model = ollama_model
+        self.ollama_url = ollama_url
+        # config
+        self.max_rounds = 10
+        self.desired_saving_pct = 0.12
+        self.grade_adjustments = {"A": 0.95, "B": 0.88, "EXPORT": 0.97}
+        self.base_concession = 0.04
+        self.round_step = 0.03
+        self.max_concession = 0.35
+
+    def _price_model(self, product: Product) -> Dict[str, int]:
         base = product.base_market_price
         grade = product.quality_grade.upper()
-        fair_multiplier = self.CONFIG["grade_adjustments"].get(grade, 0.9)
-        fair = int(base * fair_multiplier)
-        aspiration = int(max(1, fair * (1 - self.CONFIG["desired_saving_pct"])))
+        mult = self.grade_adjustments.get(grade, 0.9)
+        fair = int(base * mult)
+        aspiration = int(max(1, fair * (1 - self.desired_saving_pct)))
         reservation = fair
         return {"fair": fair, "aspiration": aspiration, "reservation": reservation}
 
-    def estimate_seller_reservation(self, seller_offers: List[int], base_market_price: int) -> int:
-        if not seller_offers:
-            return int(base_market_price * 0.85)
-        first, last = seller_offers[0], seller_offers[-1]
-        if len(seller_offers) >= 2:
-            avg_drop = (first - last) / (len(seller_offers) - 1)
-            projected = int(last - max(avg_drop, 0) * self.CONFIG["seller_min_projection_factor"])
-        else:
-            projected = int(last - 0.05 * base_market_price)
-        return max(min(projected, last), 1)
+    def decide_numeric(self, ctx: NegotiationContext, seller_price: int) -> Tuple[DealStatus, int, str]:
+        product = ctx.product
+        budget = ctx.budget
+        prices = self._price_model(product)
+        fair, aspiration, reservation = prices["fair"], prices["aspiration"], prices["reservation"]
 
-    # ---------- Opening Offer ----------
-    def generate_opening_offer(self, context: NegotiationContext) -> Tuple[int, str]:
-        prices = self.calculate_fair_and_target(context.product)
-        aspiration = prices["aspiration"]
-        jitter = random.uniform(*self.CONFIG["opening_jitter"])
-        opening = int(aspiration * (1 + jitter))
-        if context.product.quality_grade.upper() == "B":
-            opening = int(opening * 0.97)
-        opening = max(1, min(opening, context.your_budget))
-        msg = (
-            f"{random.choice(self.personality['catchphrases'])} "
-            f"Market ref ₹{context.product.base_market_price:,}. Opening at ₹{opening:,} "
-            f"(target ≤ ₹{aspiration:,})."
-        )
-        return opening, msg
-
-    # ---------- Progress Analytics ----------
-    def analyze_negotiation_progress(self, context: NegotiationContext) -> Dict[str, Any]:
-        s_hist = context.seller_offers
-        last_seller = s_hist[-1] if s_hist else None
-        last_buyer = context.your_offers[-1] if context.your_offers else None
-        trend = s_hist[-1] - s_hist[-2] if len(s_hist) >= 2 else None
-        stalled = (
-            len(s_hist) >= self.CONFIG["stalled_round_check"]
-            and len(set(s_hist[-self.CONFIG["stalled_round_check"]:])) == 1
-        )
-        return {"last_seller": last_seller, "last_buyer": last_buyer, "trend": trend, "stalled": stalled}
-
-    # ---------- Core Decision Logic ----------
-    def respond_to_seller_offer(
-        self, context: NegotiationContext, seller_price: int, seller_message: str
-    ) -> Tuple[DealStatus, int, str]:
-        cfg = self.CONFIG
-        product = context.product
-        budget = context.your_budget
-        prices = self.calculate_fair_and_target(product)
-        fair, aspiration, reservation = prices["fair"], prices["aspiration"], min(prices["reservation"], budget)
-        prog = self.analyze_negotiation_progress(context)
-        last_buyer = prog["last_buyer"] or int(product.base_market_price * 0.6)
-        est_min = self.estimate_seller_reservation(context.seller_offers, product.base_market_price)
-
-        # Accept conditions
         if seller_price <= aspiration and seller_price <= budget:
-            return DealStatus.ACCEPTED, seller_price, f"Deal at ₹{seller_price:,}. {random.choice(self.personality['catchphrases'])}"
-        if context.current_round >= cfg["late_round_threshold"] and seller_price <= min(budget, int(aspiration * (1 + cfg["late_accept_premium"]))):
-            return DealStatus.ACCEPTED, seller_price, f"I can accept ₹{seller_price:,} to close now."
-        if context.current_round >= (cfg["max_rounds"] - 2) and seller_price <= min(budget, fair):
-            return DealStatus.ACCEPTED, seller_price, f"Accepting ₹{seller_price:,} to wrap this up."
+            note = f"Accepted because seller_price ({seller_price}) <= aspiration ({aspiration}) and within budget ({budget})."
+            self.memory.add_entry({"round": ctx.current_round, "seller_price": seller_price, "buyer_offer": seller_price, "note": note})
+            return DealStatus.ACCEPTED, seller_price, note
 
-        # Over budget
         if seller_price > budget:
-            if context.current_round >= (cfg["max_rounds"] - 1) and seller_price <= int(budget * 1.03):
-                return DealStatus.ONGOING, budget, f"That's above my budget. I can stretch to ₹{budget:,} now."
-            return DealStatus.ONGOING, budget, f"Above my ceiling—best I can do is ₹{budget:,}."
+            if ctx.current_round >= max(1, int(self.max_rounds * 0.8)):
+                stretch = int(min(budget, seller_price * 0.99))
+                note = f"Seller above budget. Stretching to {stretch} in late rounds."
+                self.memory.add_entry({"round": ctx.current_round, "seller_price": seller_price, "buyer_offer": stretch, "note": note})
+                return DealStatus.ONGOING, stretch, note
+            note = f"Seller {seller_price} above budget {budget}. Holding at budget."
+            self.memory.add_entry({"round": ctx.current_round, "seller_price": seller_price, "buyer_offer": budget, "note": note})
+            return DealStatus.ONGOING, budget, note
 
-        # Concessions
-        conc = cfg["base_concession"] + cfg["round_concession_step"] * (context.current_round - 1)
-        conc = min(conc, cfg["max_concession"])
-        if prog["trend"] is not None:
-            conc *= 0.9 if prog["trend"] < 0 else 1.15
-        if prog["stalled"]:
-            conc += cfg["deadlock_boost"]
-        conc = min(conc, cfg["max_concession"])
+        conc = self.base_concession + (ctx.current_round - 1) * self.round_step
+        conc = min(conc, self.max_concession)
 
+        if product.category.lower() in ("fruits", "vegetables", "produce"):
+            conc *= 1.15
+
+        last_buyer = ctx.buyer_offers[-1] if ctx.buyer_offers else int(product.base_market_price * 0.6)
         target = int(last_buyer + (seller_price - last_buyer) * (0.35 + conc))
         counter = min(target, seller_price - 1, budget)
-        min_step = max(1000, int(cfg["min_step_pct"] * product.base_market_price))
+
+        min_step = max(100, int(0.01 * product.base_market_price))
         if counter <= last_buyer:
             counter = min(last_buyer + min_step, seller_price - 1, budget)
-        if est_min and context.current_round >= 6 and counter < est_min:
-            counter = min(budget, max(counter, est_min - int(0.01 * product.base_market_price)), seller_price - 1)
 
-        gap = max(1000, int(cfg["small_gap_pct"] * product.base_market_price))
-        near_final = (seller_price - counter) <= gap
-        explain = f"Based on fair price ₹{fair:,}. " if fair else ""
+        note = f"Countering at ₹{counter} (fair ₹{fair}, aspiration ₹{aspiration}, seller ₹{seller_price})"
+        self.memory.add_entry({"round": ctx.current_round, "seller_price": seller_price, "buyer_offer": counter, "note": note})
+        return DealStatus.ONGOING, counter, note
 
-        if near_final:
-            return DealStatus.ONGOING, counter, f"{explain}I can go to ₹{counter:,}. Near-final offer."
-        return DealStatus.ONGOING, counter, f"{explain}I can do ₹{counter:,}. {random.choice(self.personality['catchphrases'])}"
+    def _build_prompt_for_llm(self, ctx: NegotiationContext, numeric_decision: Dict[str, Any], seller_msg: str) -> str:
+        persona_block = self.personality.make_pre_act_value()
+        history_block = self.memory.make_pre_act_value()
+        prod = ctx.product
+        return (
+            f"Round {ctx.current_round}/{self.max_rounds}\n"
+            f"Product: {prod.name} | Category: {prod.category} | Grade: {prod.quality_grade} | Market ref: ₹{prod.base_market_price}\n"
+            f"Budget: ₹{ctx.budget}\n"
+            f"Seller said: {seller_msg}\n"
+            f"Numeric action: {numeric_decision['action']} at ₹{numeric_decision['price']}\n\n"
+            f"Persona: {persona_block}\n"
+            f"{history_block}\n\n"
+            "Instruction: Write a concise, professional buyer reply consistent with the numeric action. "
+            "Reference market numbers briefly and keep tone evidence-first."
+        )
 
-    def get_personality_prompt(self) -> str:
-        return "Analytical-negotiator: clear, data-backed, calm, professional. Reference market price and keep messages concise."
+    def generate_llm_response(self, prompt: str) -> str:
+        """Generate response using Ollama backend (or fallback)."""
+        if self.backend == "ollama":
+            try:
+                payload = {"model": self.ollama_model, "prompt": prompt, "stream": False}
+                response = requests.post(self.ollama_url, json=payload, timeout=150)
 
-# ============================================
-# OPTIONAL TEST HARNESS (if required)
-# ============================================
+                raw = response.text.strip()
+                if "\n" in raw:
+                    raw = raw.split("\n")[0]
 
+                try:
+                    data = response.json()
+                except Exception:
+                    import json
+                    data = json.loads(raw)
+
+                return data.get("response", "").strip() if data else "[No response]"
+            except Exception as e:
+                return f"[LLM error: {e}]"
+
+        return "[No LLM backend configured]"
+
+    def make_decision(self, ctx: NegotiationContext, seller_msg: str) -> Dict[str, Any]:
+        parsed_price = ctx.seller_offers[-1] if ctx.seller_offers else None
+        if parsed_price is None:
+            raise ValueError("No seller price available to decide on.")
+
+        status, numeric_price, note = self.decide_numeric(ctx, parsed_price)
+        numeric_decision = {"action": "accept" if status == DealStatus.ACCEPTED else "counter", "price": numeric_price, "note": note}
+
+        prompt = self._build_prompt_for_llm(ctx, numeric_decision, seller_msg)
+        llm_text = self.generate_llm_response(prompt)
+
+        self.memory.add_entry({"round": ctx.current_round, "seller_price": parsed_price, "buyer_offer": numeric_price, "buyer_text": llm_text, "note": note})
+
+        return {"status": status, "numeric_price": numeric_price, "text": llm_text, "note": note}
+
+    def get_state(self) -> Dict[str, Any]:
+        return {"backend": self.backend, "ollama_model": self.ollama_model}
+
+    def set_state(self, state: Dict[str, Any]) -> None:
+        if not state:
+            return
+        self.backend = state.get("backend", self.backend)
+        self.ollama_model = state.get("ollama_model", self.ollama_model)
+
+    def make_pre_act_value(self) -> str:
+        return f"Decision component: data-analyst strategy. Max rounds: {self.max_rounds}."
+
+# ====================================================
+# Orchestrator: run negotiation
+# ====================================================
+def seller_simulator(prev_price: Optional[int], base_price: int) -> Tuple[int, str]:
+    """Seller starts above market and slowly reduces. Also sends short message."""
+    if prev_price is None:
+        p = int(base_price * 1.18)  # start at +18%
+    else:
+        # drop 0-4% of base per round
+        drop = random.uniform(0.0, 0.04) * base_price
+        p = max(int(prev_price - drop), int(base_price * 0.85))
+    msg = f"Seller offers ₹{p:,}. Quick deal — negotiable."
+    return p, msg
+
+def score_outcome(ctx: NegotiationContext, closed_price: Optional[int]) -> Dict[str, Any]:
+    score = {"deal_success": 0, "savings_pct": 0.0, "character_consistency": 0.0}
+    if closed_price is not None:
+        score["deal_success"] = 1
+        savings = max(0, (ctx.budget - closed_price) / ctx.budget)
+        score["savings_pct"] = savings
+        # character_consistency heuristic: check if most buyer messages include marketplace numbers and calm tone
+        history = ctx.history
+        buyer_texts = [h.get("buyer_text", "") for h in history if h.get("buyer_text")]
+        references = sum(1 for t in buyer_texts if any(s in t for s in ["₹", "market", "fair", "based"]))
+        consistency = (references / max(1, len(buyer_texts))) if buyer_texts else 0.0
+        score["character_consistency"] = consistency
+    return score
+
+def run_negotiation(
+    product: Product,
+    budget: int,
+    backend: str = "ollama",
+    ollama_model: str = "llama3",
+    ollama_url: str = "http://localhost:11434/api/generate",
+    max_rounds: int = 10
+) -> Dict[str, Any]:
+    # prepare components
+    memory = MemoryComponent()
+    personality = BuyerPersonalityComponent()
+    decision = DecisionComponent(personality, memory, backend=backend, ollama_model=ollama_model, ollama_url=ollama_url)
+
+    ctx = NegotiationContext(product=product, budget=budget, current_round=0, seller_offers=[], buyer_offers=[], history=[])
+    closed_price = None
+
+    seller_price = None
+    seller_msg = "Initial offer."
+
+    print(f"Starting negotiation for {product.name}. Budget: ₹{budget:,}. Market ref: ₹{product.base_market_price:,}.\nPersona: {personality.personality['archetype']}\n")
+
+    for r in range(1, max_rounds + 1):
+        ctx.current_round = r
+        seller_price, seller_msg = seller_simulator(seller_price, product.base_market_price)
+        ctx.seller_offers.append(seller_price)
+
+        # record seller message into memory
+        memory.add_entry({"round": r, "seller_price": seller_price, "seller_msg": seller_msg})
+        # Decision component acts
+        result = decision.make_decision(ctx, seller_msg)
+
+        # attach buyer outputs to context.history
+        entry = {
+            "round": r,
+            "seller_price": seller_price,
+            "seller_msg": seller_msg,
+            "buyer_offer": result["numeric_price"],
+            "buyer_text": result["text"],
+            "status": result["status"].value,
+            "note": result["note"]
+        }
+        ctx.buyer_offers.append(result["numeric_price"])
+        ctx.history.append(entry)
+
+        # Print round summary
+        print(f"[Round {r}] Seller: ₹{seller_price:,}")
+        print(f"  Buyer numeric decision: ₹{result['numeric_price']} ({result['status'].name})")
+        print(f"  Buyer message: {result['text']}\n")
+
+        if result["status"] == DealStatus.ACCEPTED:
+            closed_price = result["numeric_price"]
+            print(f"Deal closed at ₹{closed_price:,} in round {r}.\n")
+            break
+
+    # scoring
+    scores = score_outcome(ctx, closed_price)
+    summary = {
+        "closed_price": closed_price,
+        "rounds_used": ctx.current_round,
+        "scores": scores,
+        "history": ctx.history
+    }
+    return summary
+
+# ====================================================
+# If run as main, run Mango negotiation
+# ====================================================
 if __name__ == "__main__":
-    print("YourBuyerAgent ready. Use the test harness to evaluate.")
+    # product: Mango (1 ton)
+    mango = Product(name="Mango (1 ton)", category="Fruits", quantity=1, quality_grade="A", origin="India", base_market_price=120000, attributes={})
+    budget = 100000  # buyer's max budget
+
+    # environment override for backend or model
+    backend = os.getenv("LLM_BACKEND", "ollama")
+    ollama_model = os.getenv("OLLAMA_MODEL", "llama3")
+    ollama_url = os.getenv("OLLAMA_URL", "http://localhost:11434/api/generate")
+
+    result = run_negotiation(mango, budget, backend=backend, ollama_model=ollama_model, ollama_url=ollama_url, max_rounds=10)
+
+    print("=== Negotiation Summary ===")
+    print(f"Closed price: {result['closed_price']}")
+    print(f"Rounds used: {result['rounds_used']}")
+    print("Scores:", json.dumps(result["scores"], indent=2))
+    print("\nHistory (last 10 entries):")
+    for h in result["history"]:
+        print(h)
